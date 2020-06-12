@@ -12,6 +12,14 @@
 #include "stm32f0xx.h"
 #include "stm32f0_discovery.h"
 
+#define WIDTH 80
+#define HEIGHT 60
+
+// allocate screenbuffer
+char screen[HEIGHT][WIDTH + 1];
+int curLine = HEIGHT; // start at the end of the buffer because the first line will trigger the interrupt, so it will tick over
+int lastChange = 0;
+
 void changeClockFreq() {
 	// directly lifted from A.3.2 of the Family reference (Page 940)
 	if ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_PLL)
@@ -43,8 +51,38 @@ void changeClockFreq() {
 	}
 }
 
+void TIM3_IRQHandler() {
+	/*
+	 * Update the DMA request address
+	 */
+	GPIOC->ODR |= 0x1;
+	TIM3->SR &= ~TIM_SR_CC3IF;
+	lastChange++;
+	if(lastChange >= 10) {
+		// If you don't disable the DMA request, it will immediately do a transfer when enabled
+		TIM15->DIER = 0;
+		DMA1_Channel5->CCR &= ~DMA_CCR_EN; // disable the DMA channel
+		// check if we're in the visible region of the vertical sweep
+		// remember that TIM2 also counts at the pixel clock, so multiply the line numbers by 1056
+		if((TIM2->CNT > 27 * 1056) && (TIM2->CNT < 627 * 1056)) {
+			lastChange = 0;
+			curLine += 1;
+			if(curLine >= HEIGHT)
+				curLine = 0;
+
+			DMA1_Channel5->CMAR = (int)&(screen[curLine]); // change it to a new address
+			DMA1_Channel5->CCR |= DMA_CCR_EN; // re-enable the DMA channel
+			TIM15->DIER = TIM_DIER_CC1DE;
+		}
+	}
+	GPIOC->ODR &= ~(0x1);
+}
+
 void setupHorizontalTimers() {
-	/* What we want to generate (in pixel clock units: 40 MHz):
+	/*
+	 * Setup Tim3 to output the hsync signal to A7
+	 * Also Tim15 is the pixel clock, and outputs it to A2 for reference
+	 * What we want to generate (in pixel clock units: 40 MHz):
 	 * |    800    |  40  |   128   |  88 |
 	 *                     _________
 	 * ___________________|         |______
@@ -56,7 +94,12 @@ void setupHorizontalTimers() {
 	 * |         |_________________________
 	 *                 |pixels here|
 	 *
+	 * Note: It is important that the pixel lines are all LOW when we are outside of the pixel region
+	 * At least some monitors (like mine) use that as an important sync clue.
+	 * As such, we will use an extra pixel at the end of each sync line to reset the line to 0
+	 *
 	 * How we generate this: 2 timers
+	 *
 	 * Tim3 is the master timer:
 	 *     counts at 40 MHZ, the system clock
 	 *     CCx2 is the hsync pulse output:
@@ -65,10 +108,13 @@ void setupHorizontalTimers() {
 	 * 	       Mode doesn't really matter, its only here to send the master mode output at the compare value
 	 *     	   Set compare to 128+88=216.
 	 * 	       Set Master Mode Selection to Compare Pulse, so it sends a pulse at 216 pixel clocks
+	 * 	   CCx3 triggers an interrupt right after the pixels finish outputting
+	 * 	       This is primarily to keep the DMA address up to date, but might also be good for synchronizing screen updates
+	 *
 	 * Tim15 is the pixel timer:
 	 *     Fires an update event at the actual pixel output clock (so 4 MHz)
 	 *     Uses the Repeat counter to output the appropriate number of pixels (80)
-	 *     Triggers a DMA request on every update event
+	 *     Triggers a DMA request channel 5 on every update event
 	 *     Slave mode triggered from Tim2
 	 *
 	 */
@@ -90,11 +136,21 @@ void setupHorizontalTimers() {
 	TIM3->CCER |= TIM_CCER_CC2E;
 
 	// configure CCx1, mode doesn't matter so leave it 0
-	TIM3->CCR1 = 216;
+	// should be 216, but again it's kinda slow so add a fudge factor to make the timings work
+	TIM3->CCR1 = 216 - 7;
 	TIM3->CCER |= TIM_CCER_CC1E;
 
-	// CR2_MMS = 0x3 is CC1IF flag set (pulse when CCR1 matches)
+	// CR2_MMS = 0x3 is CC1IF flag set (pulse when CCx1 matches)
 	TIM3->CR2 |= 0x3 << 4;
+
+	// configure CCx3 for the end of the pixel output region
+	// should be 1016, but it takes several clock cycles for the interrupt to actually trigger, so use a fudge factor for more time before the next line starts
+	// again, mode doesn't matter
+	TIM3->CCR3 = 1016 - 32;
+	TIM3->CCER |= TIM_CCER_CC3E;
+
+	TIM3->DIER |= TIM_DIER_CC3IE; // enable the interrupt on CCx3 so that we can get the max number of cycles after the pixels are done
+	NVIC->ISER[0] |= 1 << TIM3_IRQn; // enable the interrupt for real
 
 	// now set up the pixel TIM15
 
@@ -104,8 +160,8 @@ void setupHorizontalTimers() {
 	TIM15->PSC = 0;
 	TIM15->ARR = 9; // should create 4MHz update events
 
-	// set the RCR to only send an update event after 80 timer resets
-	TIM15->RCR = 80 - 1;
+	// set the RCR to only send an update event after 81 timer resets (80 screen pixels + 1 edge pixel)
+	TIM15->RCR = 81 - 1;
 
 	TIM15->EGR = TIM_EGR_UG; // apparently you need to generate an update event to make this kick in
 
@@ -128,10 +184,26 @@ void setupHorizontalTimers() {
 	// set up slave mode to be triggered from the output of TIM3
 	TIM15->SMCR |= 0x1 << 4; // trigger select 1 is TIM3
 	TIM15->SMCR |= 0x6; // slave mode select 6 is 'trigger mode' (start counter at rising edge)
+
+	// set up DMA channel 5:
+	// transfers one byte from memory to GPIOB->ODR, increment 80 times then circle
+	DMA1_Channel5->CCR |=
+			DMA_CCR_PL |       // set it to the highest priority
+			DMA_CCR_MINC |     // increment memory address
+			DMA_CCR_CIRC |     // enable circular mode
+			DMA_CCR_DIR;       // transfer memory -> peripheral
+	DMA1_Channel5->CNDTR = 81; // transfer 81 elements before circling back
+	DMA1_Channel5->CPAR = (int) &(GPIOB->ODR);
+	DMA1_Channel5->CMAR = (int) screen;
+
+	// set up GPIOB to output on pins 0..7
+	for(int i = 0; i < 8; i++)
+		GPIOB->MODER |= (0x1 << 2 * i);
 }
 
 void setupVerticalTimer() {
 	/*
+	 * Setup Tim2 to drive A1 to be the vsync signal
 	 * TIM2 is the timer for the vsync signal. We're going to use the same trick as TIM2 to rearrange the signal
 	 * into something easily PWM1able.
 	 * |    4    |  23 |    600    |   1   | (in units of lines)
@@ -167,10 +239,36 @@ int main(void) {
 	RCC->APB2ENR |= RCC_APB2ENR_TIM15EN;
 	RCC->AHBENR |= RCC_AHBENR_GPIOAEN;
 	RCC->AHBENR |= RCC_AHBENR_GPIOBEN;
+	RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+	RCC->AHBENR |= RCC_APB2ENR_SYSCFGEN;
+
+	RCC->AHBENR |= RCC_AHBENR_GPIOCEN;
+	GPIOC->MODER |= 0x1;
 
 	setupHorizontalTimers(); // configure TIM3 to generate the HSYNC signal, and TIM15 to trigger DMA requests for signal output
 	setupVerticalTimer(); // configure TIM2 to generate the VSYNC signal
 
+	// load some values into the framebuffer
+	for(int y = 0; y < HEIGHT; y++) {
+		for(int x = 0; x < WIDTH; x++) {
+			// red increases with horizontal
+			// blue increases with vertical
+			// green increases with the diagonal
+			screen[y][x] = ((y & 0x3) << 4) | (x & 0x3) | (((x + y) & 0x3) << 2);
+		}
+	}
+
+	// make the first line distinctive
+	for(int x = 0; x < WIDTH; x++) {
+		screen[0][x] = (x % 2 == 0)? 0xff : 0x0;
+	}
+
+	// load the right edge fake pixels with 0. They must always remain ZERO
+	for(int y = 0; y < HEIGHT; y++) {
+		screen[y][WIDTH] = 0;
+	}
+
+	//DMA1_Channel5->CCR |= DMA_CCR_EN;
 	TIM2->CR1 |= TIM_CR1_CEN;
 	TIM3->CR1 |= TIM_CR1_CEN;
 
