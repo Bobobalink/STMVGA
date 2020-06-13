@@ -114,3 +114,5 @@ local.properties
 
 # special folder for the 
 RemoteSystemsTempFiles/
+
+.idea/

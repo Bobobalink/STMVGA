@@ -15,8 +15,12 @@
 #define WIDTH 80
 #define HEIGHT 60
 
+// load pylogo image
+extern char pylogo[];
+
 // allocate screenbuffer
 char screen[HEIGHT][WIDTH + 1];
+
 int curLine = HEIGHT; // start at the end of the buffer because the first line will trigger the interrupt, so it will tick over
 int lastChange = 0;
 
@@ -251,10 +255,7 @@ int main(void) {
 	// load some values into the framebuffer
 	for(int y = 0; y < HEIGHT; y++) {
 		for(int x = 0; x < WIDTH; x++) {
-			// red increases with horizontal
-			// blue increases with vertical
-			// green increases with the diagonal
-			screen[y][x] = ((y & 0x3) << 4) | (x & 0x3) | (((x + y) & 0x3) << 2);
+			screen[y][x] = pylogo[y * WIDTH + x];
 		}
 	}
 
@@ -271,6 +272,12 @@ int main(void) {
 	//DMA1_Channel5->CCR |= DMA_CCR_EN;
 	TIM2->CR1 |= TIM_CR1_CEN;
 	TIM3->CR1 |= TIM_CR1_CEN;
+
+	for(int y = 0; y < HEIGHT; y++) {
+		for(int x = 0; x < WIDTH; x++) {
+			screen[y][x] = pylogo[y * WIDTH + x];
+		}
+	}
 
 	for(;;);
 }
