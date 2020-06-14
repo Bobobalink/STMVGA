@@ -15,15 +15,23 @@
 #define WIDTH 80
 #define HEIGHT 60
 
-// load pylogo image
+// load images
 extern char pylogo[];
+extern char lenna[];
+extern char rickslide[];
 
 // allocate screenbuffer
 char screen[HEIGHT][WIDTH + 1];
 
+// flag for the interrupt that triggers when the screen in drawn
+char lendflag = 0;
+
 int curLine = HEIGHT; // start at the end of the buffer because the first line will trigger the interrupt, so it will tick over
 int lastChange = 0;
 
+/*
+ * change the system's clock frequency to 40 MHz
+ */
 void changeClockFreq() {
 	// directly lifted from A.3.2 of the Family reference (Page 940)
 	if ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_PLL)
@@ -55,10 +63,10 @@ void changeClockFreq() {
 	}
 }
 
+/*
+ * Update the DMA request address after each line
+ */
 void TIM3_IRQHandler() {
-	/*
-	 * Update the DMA request address
-	 */
 	GPIOC->ODR |= 0x1;
 	TIM3->SR &= ~TIM_SR_CC3IF;
 	lastChange++;
@@ -82,10 +90,27 @@ void TIM3_IRQHandler() {
 	GPIOC->ODR &= ~(0x1);
 }
 
+/*
+ * handler called immediately after the frame has finished drawing
+ * just sets a flag because we shouldn't spend a long time processing in an interrupt
+ * TODO: could do this as a DMA request, but that's less flexible
+ * this sets us up nicely for 'racing the beam'.
+ * You have a buffer of 29,568 clock cycles of buffer between this interrupt starting to be triggered and the first pixel being drawn
+ * then you have 10 clock cycles per pixel + 256 clock cycles at the end of each line (minus the TIM3 interrupt code)
+ * total, there are 663,168 clock cycles until this triggers again
+ */
+void TIM2_IRQHandler() {
+	TIM2->SR &= ~TIM_SR_CC3IF;
+	lendflag = 1;
+}
+
+/*
+ * Setup Tim3 to output the hsync signal to A7
+ * Also Tim15 is the pixel clock, and outputs it to A2 for reference
+ * Tim15 does a DMA request to copy each pixel to GPIOB so it can drive the DAC
+ */
 void setupHorizontalTimers() {
 	/*
-	 * Setup Tim3 to output the hsync signal to A7
-	 * Also Tim15 is the pixel clock, and outputs it to A2 for reference
 	 * What we want to generate (in pixel clock units: 40 MHz):
 	 * |    800    |  40  |   128   |  88 |
 	 *                     _________
@@ -155,6 +180,7 @@ void setupHorizontalTimers() {
 
 	TIM3->DIER |= TIM_DIER_CC3IE; // enable the interrupt on CCx3 so that we can get the max number of cycles after the pixels are done
 	NVIC->ISER[0] |= 1 << TIM3_IRQn; // enable the interrupt for real
+	NVIC_SetPriority(TIM3_IRQn, 3); // set it to the highest priority
 
 	// now set up the pixel TIM15
 
@@ -205,9 +231,11 @@ void setupHorizontalTimers() {
 		GPIOB->MODER |= (0x1 << 2 * i);
 }
 
+/*
+ * Setup Tim2 to drive A1 to be the vsync signal
+ */
 void setupVerticalTimer() {
 	/*
-	 * Setup Tim2 to drive A1 to be the vsync signal
 	 * TIM2 is the timer for the vsync signal. We're going to use the same trick as TIM2 to rearrange the signal
 	 * into something easily PWM1able.
 	 * |    4    |  23 |    600    |   1   | (in units of lines)
@@ -233,6 +261,13 @@ void setupVerticalTimer() {
 	TIM2->CCMR1 |= (0x6 << 4) << 8;
 	TIM2->CCR2 = 4 * 1056;
 	TIM2->CCER |= TIM_CCER_CC2E;
+
+	// add a screen refresh interrupt that triggers immediately after the visible region of the screen is drawn
+	TIM2->CCR3 = 1056 * 627;
+	TIM2->CCER |= TIM_CCER_CC3E;
+	TIM2->DIER |= TIM_DIER_CC3IE;
+	NVIC->ISER[0] |= 1 << TIM2_IRQn;
+	NVIC_SetPriority(TIM2_IRQn, 0); // set it to low priority
 }
 
 int main(void) {
@@ -252,32 +287,23 @@ int main(void) {
 	setupHorizontalTimers(); // configure TIM3 to generate the HSYNC signal, and TIM15 to trigger DMA requests for signal output
 	setupVerticalTimer(); // configure TIM2 to generate the VSYNC signal
 
-	// load some values into the framebuffer
-	for(int y = 0; y < HEIGHT; y++) {
-		for(int x = 0; x < WIDTH; x++) {
-			screen[y][x] = pylogo[y * WIDTH + x];
-		}
-	}
-
-	// make the first line distinctive
-	for(int x = 0; x < WIDTH; x++) {
-		screen[0][x] = (x % 2 == 0)? 0xff : 0x0;
-	}
-
 	// load the right edge fake pixels with 0. They must always remain ZERO
 	for(int y = 0; y < HEIGHT; y++) {
 		screen[y][WIDTH] = 0;
 	}
 
-	//DMA1_Channel5->CCR |= DMA_CCR_EN;
 	TIM2->CR1 |= TIM_CR1_CEN;
 	TIM3->CR1 |= TIM_CR1_CEN;
 
-	for(int y = 0; y < HEIGHT; y++) {
-		for(int x = 0; x < WIDTH; x++) {
-			screen[y][x] = pylogo[y * WIDTH + x];
+	for(;;) {
+		asm("wfi"); // wait for an interrupt to be triggered
+		if(lendflag) { // if we just finished drawing a frame
+			for(int y = 0; y < HEIGHT; y++) {
+				for(int x = 0; x < WIDTH; x++) {
+					screen[y][x] = rickslide[y * WIDTH + x];
+				}
+			}
+			lendflag = 0; // we're done drawing the frame
 		}
 	}
-
-	for(;;);
 }

@@ -37,7 +37,7 @@ def main():
     img = cv.imread(nameIn)
     img = cv.resize(img, (80, 60), interpolation=cv.INTER_AREA)
     with open(imgName + '.c', 'w') as outf:
-        outf.write('const char image[4800] = {\n')
+        outf.write('const char {}[4800] = {{\n'.format(imgName))
         for x in range(60):
             for y in range(80):
                 outf.write('{}'.format(getColorMatch(img[x, y])))
